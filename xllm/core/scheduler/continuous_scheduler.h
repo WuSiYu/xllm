@@ -55,6 +55,9 @@ class ContinuousScheduler : public Scheduler {
     // the number of speculative tokens per step
     PROPERTY(int32_t, num_speculative_tokens) = 0;
 
+    // the number of tp*dp nodes
+    PROPERTY(int32_t, nnodes) = 1;
+
     // the number of speculative tokens per step
     PROPERTY(int32_t, dp_size) = 1;
 
@@ -245,7 +248,7 @@ class ContinuousScheduler : public Scheduler {
       RequestPriorityQueue& waiting_priority_queue,
       size_t& num_online_prefill_preempt_offline_requests,
       std::vector<std::shared_ptr<Request>>& finished_requests);
-  void handle_decode_requests(
+  virtual void handle_decode_requests(
       size_t& latency_budget,
       size_t& estimate_latency,
       size_t& remaining_token_budget,

@@ -43,8 +43,33 @@ limitations under the License.
 namespace xllm {
 
 PDOOCScheduler::PDOOCScheduler(Engine* engine, const Options& options)
-    : ContinuousScheduler(engine, options) {
+    : ContinuousScheduler(engine, options),
+      llm_flops_(engine->model_args().n_layers(),
+                 engine->model_args().vocab_size(),
+                 engine->model_args().hidden_size(),
+                 engine->model_args().intermediate_size(),
+                 engine->model_args().n_kv_heads().has_value()
+                     ? engine->model_args().n_heads() /
+                           engine->model_args().n_kv_heads().value()
+                     : 1,
+                 engine->model_args().dtype() == "int8" ? 1 : 2,  // FIXME
+                 options_.nnodes() / options_.dp_size()) {
   VLOG(1) << "Creating a PD OOC Scheduler";
+
+  perf_model::set_perf_model(std::make_shared<perf_model::PerfModel>(
+      390 * 1e12 * 0.59,  // FLOPs/s GEMM
+      // 390 * 1e12 * 0.59,  // FLOPs/s ATTN_P
+      390 * 1e12 * 0.40,  // FLOPs/s ATTN_D
+      1600 * 1e9 * 0.60,  // MEM BW GEMM
+      1600 * 1e9 * 0.38,  // MEM BW ATTN
+      100 * 1e9,          // net
+      0.006,              // prefill overhead
+      0.001               // decode overhead
+      ));
+
+  linear_saturation_bs_ = llm_flops_.linear_saturation_bs();
+
+  LOG(INFO) << "LLM linear saturation batch size: " << linear_saturation_bs_;
 
   if (!options_.instance_role().has_value()) {
     LOG(FATAL) << "Instance type is not set in disagg pd mode.";
@@ -285,6 +310,8 @@ std::vector<Batch> PDOOCScheduler::prepare_batch() {
   // Include those requests that are preempted by others.
   std::shared_ptr<Request> request;
   // read from request queue then push to waiting priority queue
+
+  std::vector<std::shared_ptr<xllm::Request>> deferred_reqs;
   while (request_queue_.read(request)) {
     CHECK(request);
 
@@ -300,19 +327,34 @@ std::vector<Batch> PDOOCScheduler::prepare_batch() {
 
     if (request->sequences()[0]->kv_state().kv_cache_tokens_num() == 0) {
       if (request->offline()) {
-        waiting_priority_queue_offline_.push(request);
-        // DVLOG << "Put an offline request into
-        // waiting_priority_queue_offline_";
+        int current_offline_decode_bs =
+            running_requests_.size() + waiting_priority_queue_offline_.size();
+        DVLOG << "Current offline decode batch size: "
+              << current_offline_decode_bs
+              << ", linear_saturation_bs_: " << linear_saturation_bs_;
+        if (current_offline_decode_bs < linear_saturation_bs_) {
+          waiting_priority_queue_offline_.push(request);
+          // DVLOG << "Put an offline request into
+          // waiting_priority_queue_offline_";
+        } else {
+          deferred_reqs.emplace_back(request);
+          // DVLOG << "Deferred an offline request";
+        }
       } else {
         waiting_priority_queue_.push(request);
         // DVLOG << "Put an online request into
-        // waiting_priority_queue_offline_";
+        // waiting_priority_queue_";
       }
     } else {
       // request from prefill instance in disagge pd mode.
       running_requests_.emplace_back(request);
     }
   }
+
+  for (auto& req : deferred_reqs) {
+    request_queue_.write(req);
+  }
+  deferred_reqs.clear();
 
   // handle finished/cancelled requests
   std::vector<std::shared_ptr<Request>> finished_requests;
@@ -563,6 +605,7 @@ void PDOOCScheduler::handle_prefill_interruption() {
 }
 
 void PDOOCScheduler::decode_step(const absl::Duration& timeout) {
+  _decode_step_global_batch_req_lens.clear();
   ContinuousScheduler::step(timeout);
   // Check memory utilization rate to see if the scheduler is able to pull an
   // offline request from a P node
@@ -570,6 +613,231 @@ void PDOOCScheduler::decode_step(const absl::Duration& timeout) {
     // Trigger decode_send_pull_signal()
     decode_send_pull_signal_pending_.store(false);
     decode_send_pull_signal_cv_.notify_all();
+  }
+}
+
+// copy+modify from ContinuousScheduler::handle_decode_requests
+// 由于父类写法限制，需要依赖手工维护 _decode_step_global_batch_req_lens
+void PDOOCScheduler::handle_decode_requests(
+    size_t& latency_budget,
+    size_t& estimate_latency,
+    size_t& remaining_token_budget,
+    size_t& remaining_seq_budget,
+    size_t& num_offline_decode_preempt_offline_requests,
+    size_t& num_online_decode_preempt_online_requests,
+    size_t& num_online_decode_preempt_offline_requests,
+    std::unique_ptr<DecodePriorityQueue>& running_queue) {
+  // only used in decode step
+  if (options_.instance_role().value() != InstanceRole::DECODE) {
+    return ContinuousScheduler::handle_decode_requests(
+        latency_budget,
+        estimate_latency,
+        remaining_token_budget,
+        remaining_seq_budget,
+        num_offline_decode_preempt_offline_requests,
+        num_online_decode_preempt_online_requests,
+        num_online_decode_preempt_offline_requests,
+        running_queue);
+  }
+
+  LOG(INFO) << "PDOOCScheduler::handle_decode_requests, start "
+            << options_.enable_latency_aware_schedule() << ", "
+            << options_.max_global_tpot_ms();
+
+  if (options_.enable_latency_aware_schedule() != true) {
+    throw std::runtime_error(
+        "PDOOCScheduler::handle_decode_requests only supports "
+        "latency_aware_schedule");
+  }
+
+  double DECODE_SLO = options_.max_global_tpot_ms() / 1000.0;
+  int CHECK_INTERVAL = 20;
+
+  int num_offline = 0;
+  double new_batch_latency = 0.0;
+  while (!running_queue->empty() &&
+         remaining_token_budget > options_.num_speculative_tokens() &&
+         latency_budget > estimate_latency && remaining_seq_budget > 0) {
+    std::shared_ptr<Request> request = running_queue->top();
+    // TODO: check if request is timeout
+
+    const size_t num_sequences = request->sequences().size();
+    std::vector<Sequence*> candidate_sequences;
+    std::vector<size_t> candidate_token_budgets;
+    candidate_sequences.reserve(num_sequences);
+    candidate_token_budgets.reserve(num_sequences);
+
+    bool has_enough_budget = true;
+    bool has_enough_blocks = true;
+    size_t allocated_tokens = 0;
+    size_t allocated_seqs = 0;
+    size_t allocated_estimate_batch_latency = 0;
+    if (request->offline()) {
+      ++num_offline;
+    }
+
+    for (auto& sequence : request->sequences()) {
+      // skip finished sequence.
+      if (sequence->finished()) {
+        continue;
+      }
+      // no budget left
+
+      // NOTE: 我们这里不用原逻辑递减latency做判断，而是对整个batch做预测
+      _decode_step_global_batch_req_lens.push_back(
+          sequence.get()->num_tokens());
+      LOG(INFO) << "_decode_step_global_batch_req_lens.size(): "
+                << _decode_step_global_batch_req_lens.size();
+      if (_decode_step_global_batch_req_lens.size() % CHECK_INTERVAL == 0 ||
+          !new_batch_latency) {
+        new_batch_latency =
+            llm_flops_.decode(_decode_step_global_batch_req_lens).latency;
+
+        LOG(INFO) << "DEBUG - Estimated decode latency for request "
+                  << request->request_id() << " with "
+                  << _decode_step_global_batch_req_lens.size() << " reqs ("
+                  << num_offline << " offline): " << new_batch_latency << "s";
+        if (new_batch_latency > DECODE_SLO * 0.9) {
+          LOG(INFO)
+              << "DEBUG - Estimated decode latency is close to or exceeds "
+                 "SLO, stop scheduling more requests in this batch.";
+          has_enough_budget = false;
+          break;
+        }
+      }
+
+      // size_t seq_estimate_latency = 0;
+      // if (options_.enable_latency_aware_schedule()) {
+      //   seq_estimate_latency =
+      //       profile_manager_->predict_step_time(sequence.get(), false);
+      //   if (estimate_latency + allocated_estimate_latency +
+      //           seq_estimate_latency >
+      //       latency_budget) {
+      //     has_enough_budget = false;
+      //     break;
+      //   }
+      // }
+
+      if (allocated_tokens + options_.num_speculative_tokens() >=
+              remaining_token_budget ||
+          allocated_seqs >= remaining_seq_budget) {
+        has_enough_budget = false;
+        break;
+      }
+      // sequence token already appended
+      size_t updated_num_tokens =
+          sequence->num_tokens() + options_.num_speculative_tokens();
+      // no blocks left
+      if (!block_manager_pool_->allocate(sequence.get(), updated_num_tokens)) {
+        has_enough_blocks = false;
+        break;
+      }
+
+      if (sequence->if_cache_block_for_prefill()) {
+        block_manager_pool_->cache(sequence.get());
+      }
+
+      // update the allocated tokens for the sequence
+      allocated_tokens += options_.num_speculative_tokens() + 1;
+      allocated_seqs += 1;
+      allocated_estimate_batch_latency = new_batch_latency * 1000;
+      candidate_sequences.emplace_back(sequence.get());
+      candidate_token_budgets.emplace_back(options_.num_speculative_tokens() +
+                                           1);
+    }
+    CHECK(allocated_tokens <= remaining_token_budget);
+    CHECK(allocated_seqs <= remaining_seq_budget);
+
+    // schedule candidates in the request if there are enough blocks
+    if (has_enough_budget && has_enough_blocks) {
+      // remove the request from the priority queue
+      running_queue->pop_top();
+      // add the request to the batch
+      running_requests_.emplace_back(request);
+      running_sequences_.insert(running_sequences_.end(),
+                                candidate_sequences.begin(),
+                                candidate_sequences.end());
+      running_sequences_budgets_.insert(running_sequences_budgets_.end(),
+                                        candidate_token_budgets.begin(),
+                                        candidate_token_budgets.end());
+      remaining_token_budget -= allocated_tokens;
+      remaining_seq_budget -= allocated_seqs;
+      estimate_latency = allocated_estimate_batch_latency;
+
+      LOG(INFO) << "Scheduled request " << request->request_id()
+                << "remaining_token_budget: " << remaining_token_budget
+                << ", remaining_seq_budget: " << remaining_seq_budget
+                << ", estimate_latency: " << estimate_latency;
+
+      continue;
+    }
+
+    // budget exhausted, do partially schedule the request
+    if (!has_enough_budget) {
+      handle_abnormal_request(running_queue,
+                              candidate_sequences,
+                              candidate_token_budgets,
+                              allocated_tokens,
+                              allocated_seqs,
+                              allocated_estimate_batch_latency,
+                              remaining_token_budget,
+                              remaining_seq_budget,
+                              estimate_latency,
+                              true, /*budget_exhausted*/
+                              false /*blocks_exhausted*/);
+      break;
+    }
+
+    // memory exhausted, try to preempt lowest priority request
+    // continue to evict blocks until enough or no other requests that can be
+    // preempted
+    if (options_.enable_online_preempt_offline() && !request->offline() &&
+        !running_queue_offline_->empty()) {
+      std::shared_ptr<Request> request_to_preempt =
+          running_queue_offline_->back();
+      ++num_online_decode_preempt_offline_requests;
+      block_manager_pool_->deallocate(request_to_preempt.get());
+      running_queue_offline_->pop_back();
+      // add preemptable request to waiting priority queue
+      request_to_preempt->set_preempted();
+      waiting_priority_queue_offline_.push(request_to_preempt);
+      continue;
+    } else if (running_queue->size() > 1) {
+      std::shared_ptr<Request> request_to_preempt = running_queue->back();
+      if (request_to_preempt.get() != request.get()) {
+        // TO IMPROVE: kv cache offload to cpu
+        block_manager_pool_->deallocate(request_to_preempt.get());
+        running_queue->pop_back();
+        // add preemptable request to waiting priority queue
+        request_to_preempt->set_preempted();
+        if (request_to_preempt->offline()) {
+          ++num_offline_decode_preempt_offline_requests;
+          waiting_priority_queue_offline_.push(request_to_preempt);
+        } else {
+          ++num_online_decode_preempt_online_requests;
+          waiting_priority_queue_.push(request_to_preempt);
+        }
+
+      } else {
+        LOG(FATAL) << "Unexpected error: preempting the candidate itself.";
+      }
+
+      continue;
+    }
+
+    // no requests left to preempt
+    handle_abnormal_request(running_queue,
+                            candidate_sequences,
+                            candidate_token_budgets,
+                            allocated_tokens,
+                            allocated_seqs,
+                            allocated_estimate_batch_latency,
+                            remaining_token_budget,
+                            remaining_seq_budget,
+                            estimate_latency,
+                            false, /*budget_exhausted*/
+                            true /*blocks_exhausted*/);
+    break;
   }
 }
 
@@ -611,6 +879,19 @@ void PDOOCScheduler::decode_send_pull_signal() {
     // Send a pull signal to the selected prefill instance
     proto::PullSignal pull_signal;
     pull_signal.set_source_instance_name(xservice_client_->get_instance_name());
+
+    google::protobuf::uint64 preferred_len = 0;
+    auto available_tokens = block_manager_pool_->num_free_blocks()[0] *
+                            block_manager_pool_->options().block_size();
+    pull_signal.set_max_total_len(available_tokens);
+
+    preferred_len =
+        llm_flops_.decode_preferred_req_len(_decode_step_global_batch_req_lens,
+                                            linear_saturation_bs_,
+                                            options_.max_global_tpot_ms(),
+                                            available_tokens);
+    pull_signal.set_preferred_req_len(preferred_len);
+
     proto::Status resp;
     brpc::Controller cntl;
     stub->SendPullSignal(&cntl, &pull_signal, &resp, nullptr);
@@ -1484,21 +1765,34 @@ void PDOOCScheduler::prepare_offline_dispatch_queue() {
     // DVLOG << "Processing a pull signal from: " <<
     // pull_signal.source_instance_name();
 
+    auto preferred_len = pull_signal.preferred_req_len();
+    auto max_len = pull_signal.max_total_len();
+
     // Find an offline decoding request in running_requests_ to move to dispatch
     // queue
+    size_t selected_red_idx = running_requests_.size();
+    int minimal_diff = std::numeric_limits<int>::max();
     std::shared_ptr<Request> offline_request = nullptr;
     for (size_t i = 0; i < running_requests_.size(); ++i) {
       auto& request = running_requests_[i];
       if (request && request->offline() && !request->sequences().empty() &&
           !request->sequences()[0]->is_prefill_stage()) {
-        offline_request = request;
-        running_requests_[i] =
-            nullptr;  // Remove the request from running_requests_
-        break;
+        size_t req_len = request->sequences()[0]->num_tokens();
+        if (req_len <= max_len) {
+          size_t diff = preferred_len > req_len ? preferred_len - req_len
+                                                : req_len - preferred_len;
+          if (diff < minimal_diff) {
+            minimal_diff = diff;
+            selected_red_idx = i;
+            offline_request = request;
+          }
+        }
       }
     }
 
     if (offline_request) {
+      running_requests_[selected_red_idx] =
+          nullptr;  // Remove the request from running_requests_
       // Add to offline dispatch queue with the source instance name
       std::pair<std::shared_ptr<Request>, std::string> dispatch_pair =
           std::make_pair(offline_request, pull_signal.source_instance_name());
@@ -1506,7 +1800,10 @@ void PDOOCScheduler::prepare_offline_dispatch_queue() {
 
       DVLOG << "Moved offline request " << offline_request->request_id()
             << " to dispatch queue for instance "
-            << pull_signal.source_instance_name();
+            << pull_signal.source_instance_name()
+            << "\n        preferred_len: " << preferred_len
+            << ", max_len: " << max_len << ", selected len: "
+            << offline_request->sequences()[0]->num_tokens();
     } else {
       // If no offline request, put the signal back for future use.
       unused_signals.push_back(pull_signal);

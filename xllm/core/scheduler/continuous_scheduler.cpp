@@ -380,7 +380,11 @@ void ContinuousScheduler::handle_decode_requests(
       }
       // no budget left
       size_t seq_estimate_latency = 0;
-      if (options_.enable_latency_aware_schedule()) {
+      if (options_.enable_latency_aware_schedule()
+
+          // force not enabled on prefill node (only offline req decode here)
+          && !(options_.instance_role().has_value() &&
+               options_.instance_role().value() == InstanceRole::PREFILL)) {
         seq_estimate_latency =
             profile_manager_->predict_step_time(sequence.get(), false);
         if (estimate_latency + allocated_estimate_latency +
