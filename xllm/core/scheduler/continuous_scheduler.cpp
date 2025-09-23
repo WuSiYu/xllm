@@ -280,7 +280,7 @@ void ContinuousScheduler::handle_prefill_requests(
                 seq_estimate_latency >
             latency_budget) {
           // release shared prefix blocks
-          block_manager_pool_->deallocate(prefill_sequence.get());
+          // block_manager_pool_->deallocate(prefill_sequence.get());
           can_schedule = false;
           budget_exhausted = true;
           break;
@@ -913,7 +913,31 @@ void ContinuousScheduler::step(const absl::Duration& timeout) {
     if (all_empty) {
       return;
     }
+
+    _debug_last_batch_lengths.clear();
+    for (size_t i = 0; i < batch.size(); i++) {
+      for (size_t j = 0; j < batch[i].size(); j++) {
+        _debug_last_batch_lengths.push_back(batch[i][j]->num_tokens());
+      }
+    }
+    auto start = std::chrono::high_resolution_clock::now();
     engine_->step(batch);
+    auto end = std::chrono::high_resolution_clock::now();
+    double duration_ms =
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+            .count() /
+        1000.0;
+    std::stringstream ss;
+    ss << "bs=" << _debug_last_batch_lengths.size() << " - [";
+    for (size_t i = 0; i < _debug_last_batch_lengths.size(); ++i) {
+      ss << _debug_last_batch_lengths[i];
+      if (i != _debug_last_batch_lengths.size() - 1) ss << ", ";
+    }
+    ss << "]";
+
+    LOG(INFO) << "PERF - " << ss.str() << " - " << std::fixed
+              << std::setprecision(3) << duration_ms << " ms";
+
     block_manager_pool_->reset_copy_content();
     // process request output in batch
     process_batch_output(false);

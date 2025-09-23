@@ -170,6 +170,8 @@ class ContinuousScheduler : public Scheduler {
 
   const InstanceInfo& get_instance_info() { return instance_info_; }
 
+  std::vector<int> _debug_last_batch_lengths;
+
  protected:
   // allocate actual token_num slots.
   std::vector<Block> allocate_blocks_for(size_t token_num, int32_t& dp_rank);

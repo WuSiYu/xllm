@@ -271,6 +271,8 @@ class PDOOCScheduler : public ContinuousScheduler {
   perf_model::LLMFlops llm_flops_;
   int linear_saturation_bs_;
   vector<int> _decode_step_global_batch_req_lens;
+  double _decode_last_step_latency = 0;
+  vector<int> _last_decode_step_global_batch_req_lens;
 };
 
 }  // namespace xllm

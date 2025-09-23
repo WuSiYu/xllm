@@ -44,6 +44,9 @@ namespace xllm {
 
 PDOOCScheduler::PDOOCScheduler(Engine* engine, const Options& options)
     : ContinuousScheduler(engine, options),
+      waiting_priority_queue_(create_comparator(options.priority_strategy())),
+      waiting_priority_queue_offline_(
+          create_comparator(options.priority_strategy())),
       llm_flops_(engine->model_args().n_layers(),
                  engine->model_args().vocab_size(),
                  engine->model_args().hidden_size(),
@@ -57,11 +60,11 @@ PDOOCScheduler::PDOOCScheduler(Engine* engine, const Options& options)
   VLOG(1) << "Creating a PD OOC Scheduler";
 
   perf_model::set_perf_model(std::make_shared<perf_model::PerfModel>(
-      390 * 1e12 * 0.59,  // FLOPs/s GEMM
+      390 * 1e12 * 0.60,  // FLOPs/s GEMM
       // 390 * 1e12 * 0.59,  // FLOPs/s ATTN_P
-      390 * 1e12 * 0.40,  // FLOPs/s ATTN_D
+      390 * 1e12 * 0.30,  // FLOPs/s ATTN_D
       1600 * 1e9 * 0.60,  // MEM BW GEMM
-      1600 * 1e9 * 0.38,  // MEM BW ATTN
+      1600 * 1e9 * 0.30,  // MEM BW ATTN
       100 * 1e9,          // net
       0.006,              // prefill overhead
       0.001               // decode overhead
@@ -594,6 +597,10 @@ void PDOOCScheduler::handle_prefill_interruption() {
     request->set_preempted();
 
     // Add back to offline waiting queue for rescheduling
+    DVLOG << "Preempting offline request due to interruption: "
+          << request->request_id();
+    DVLOG << "waiting_priority_queue_offline_.size() before push: "
+          << waiting_priority_queue_offline_.size();
     waiting_priority_queue_offline_.push(request);
 
     DVLOG << "Preempted offline request due to interruption: "
@@ -607,6 +614,11 @@ void PDOOCScheduler::handle_prefill_interruption() {
 void PDOOCScheduler::decode_step(const absl::Duration& timeout) {
   _decode_step_global_batch_req_lens.clear();
   ContinuousScheduler::step(timeout);
+  // DEBUG ONLY
+  LOG(INFO) << " - PERF_MODEL_DEBUG: "
+            << llm_flops_.decode(_debug_last_batch_lengths).latency * 1000
+            << " ms";
+
   // Check memory utilization rate to see if the scheduler is able to pull an
   // offline request from a P node
   if (check_able_to_pull()) {
@@ -614,6 +626,7 @@ void PDOOCScheduler::decode_step(const absl::Duration& timeout) {
     decode_send_pull_signal_pending_.store(false);
     decode_send_pull_signal_cv_.notify_all();
   }
+  _last_decode_step_global_batch_req_lens = _decode_step_global_batch_req_lens;
 }
 
 // copy+modify from ContinuousScheduler::handle_decode_requests
@@ -640,18 +653,12 @@ void PDOOCScheduler::handle_decode_requests(
         running_queue);
   }
 
-  LOG(INFO) << "PDOOCScheduler::handle_decode_requests, start "
-            << options_.enable_latency_aware_schedule() << ", "
-            << options_.max_global_tpot_ms();
-
-  if (options_.enable_latency_aware_schedule() != true) {
-    throw std::runtime_error(
-        "PDOOCScheduler::handle_decode_requests only supports "
-        "latency_aware_schedule");
-  }
+  // LOG(INFO) << "PDOOCScheduler::handle_decode_requests, start."
+  //           << options_.enable_latency_aware_schedule()
+  //           << ", max_global_tpot_ms=" << options_.max_global_tpot_ms();
 
   double DECODE_SLO = options_.max_global_tpot_ms() / 1000.0;
-  int CHECK_INTERVAL = 20;
+  int CHECK_INTERVAL = 3;
 
   int num_offline = 0;
   double new_batch_latency = 0.0;
@@ -692,6 +699,7 @@ void PDOOCScheduler::handle_decode_requests(
           !new_batch_latency) {
         new_batch_latency =
             llm_flops_.decode(_decode_step_global_batch_req_lens).latency;
+        _decode_last_step_latency = new_batch_latency;
 
         LOG(INFO) << "DEBUG - Estimated decode latency for request "
                   << request->request_id() << " with "
@@ -885,11 +893,11 @@ void PDOOCScheduler::decode_send_pull_signal() {
                             block_manager_pool_->options().block_size();
     pull_signal.set_max_total_len(available_tokens);
 
-    preferred_len =
-        llm_flops_.decode_preferred_req_len(_decode_step_global_batch_req_lens,
-                                            linear_saturation_bs_,
-                                            options_.max_global_tpot_ms(),
-                                            available_tokens);
+    preferred_len = llm_flops_.decode_preferred_req_len(
+        _last_decode_step_global_batch_req_lens,
+        linear_saturation_bs_,
+        options_.max_global_tpot_ms(),
+        available_tokens);
     pull_signal.set_preferred_req_len(preferred_len);
 
     proto::Status resp;
@@ -1742,8 +1750,9 @@ void PDOOCScheduler::update_token_latency_metrics(
 // TODO Need parameters tuning
 bool PDOOCScheduler::check_able_to_pull() {
   // Estimated usage of current requests: half of current used blocks.
-  return block_manager_pool_->kv_cache_utilization() * 2 <
-         FLAGS_prefill_scheduling_memory_usage_threshold;
+  return block_manager_pool_->kv_cache_utilization() < 0.9 &&
+         _decode_last_step_latency <
+             options_.max_global_tpot_ms() / 1000.0 * 0.9;
 }
 
 bool PDOOCScheduler::write_pull_signal(const proto::PullSignal& pull_signal) {
