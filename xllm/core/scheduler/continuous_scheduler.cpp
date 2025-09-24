@@ -905,6 +905,7 @@ void ContinuousScheduler::prepare_cache_async(
 void ContinuousScheduler::step(const absl::Duration& timeout) {
   if (!options_.enable_schedule_overlap()) {
     // get a new batch of requests
+    _debug_last_batch_lengths.clear();
     std::vector<Batch> batch = schedule_request(timeout);
     bool all_empty =
         std::all_of(batch.begin(), batch.end(), [](const Batch& one_batch) {
@@ -914,7 +915,6 @@ void ContinuousScheduler::step(const absl::Duration& timeout) {
       return;
     }
 
-    _debug_last_batch_lengths.clear();
     for (size_t i = 0; i < batch.size(); i++) {
       for (size_t j = 0; j < batch[i].size(); j++) {
         _debug_last_batch_lengths.push_back(batch[i][j]->num_tokens());

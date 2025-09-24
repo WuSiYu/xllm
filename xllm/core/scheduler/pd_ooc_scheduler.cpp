@@ -60,14 +60,14 @@ PDOOCScheduler::PDOOCScheduler(Engine* engine, const Options& options)
   VLOG(1) << "Creating a PD OOC Scheduler";
 
   perf_model::set_perf_model(std::make_shared<perf_model::PerfModel>(
-      390 * 1e12 * 0.60,  // FLOPs/s GEMM
+      390 * 1e12 * 0.68,  // FLOPs/s GEMM
       // 390 * 1e12 * 0.59,  // FLOPs/s ATTN_P
-      390 * 1e12 * 0.30,  // FLOPs/s ATTN_D
-      1600 * 1e9 * 0.60,  // MEM BW GEMM
-      1600 * 1e9 * 0.30,  // MEM BW ATTN
+      390 * 1e12 * 0.60,  // FLOPs/s ATTN_D
+      1600 * 1e9 * 0.58,  // MEM BW GEMM
+      1600 * 1e9 * 0.38,  // MEM BW ATTN
       100 * 1e9,          // net
-      0.006,              // prefill overhead
-      0.001               // decode overhead
+      0.018,              // prefill overhead
+      0.002               // decode overhead
       ));
 
   linear_saturation_bs_ = llm_flops_.linear_saturation_bs();
@@ -615,9 +615,11 @@ void PDOOCScheduler::decode_step(const absl::Duration& timeout) {
   _decode_step_global_batch_req_lens.clear();
   ContinuousScheduler::step(timeout);
   // DEBUG ONLY
-  LOG(INFO) << " - PERF_MODEL_DEBUG: "
-            << llm_flops_.decode(_debug_last_batch_lengths).latency * 1000
-            << " ms";
+  if (_debug_last_batch_lengths.size()) {
+    LOG(INFO) << " - PERF_MODEL_DEBUG: "
+              << llm_flops_.decode(_debug_last_batch_lengths).latency * 1000
+              << " ms";
+  }
 
   // Check memory utilization rate to see if the scheduler is able to pull an
   // offline request from a P node
@@ -693,19 +695,19 @@ void PDOOCScheduler::handle_decode_requests(
       // NOTE: 我们这里不用原逻辑递减latency做判断，而是对整个batch做预测
       _decode_step_global_batch_req_lens.push_back(
           sequence.get()->num_tokens());
-      LOG(INFO) << "_decode_step_global_batch_req_lens.size(): "
-                << _decode_step_global_batch_req_lens.size();
+      // LOG(INFO) << "_decode_step_global_batch_req_lens.size(): "
+      //           << _decode_step_global_batch_req_lens.size();
       if (_decode_step_global_batch_req_lens.size() % CHECK_INTERVAL == 0 ||
           !new_batch_latency) {
         new_batch_latency =
             llm_flops_.decode(_decode_step_global_batch_req_lens).latency;
         _decode_last_step_latency = new_batch_latency;
 
-        LOG(INFO) << "DEBUG - Estimated decode latency for request "
-                  << request->request_id() << " with "
-                  << _decode_step_global_batch_req_lens.size() << " reqs ("
-                  << num_offline << " offline): " << new_batch_latency << "s";
-        if (new_batch_latency > DECODE_SLO * 0.9) {
+        if (new_batch_latency > DECODE_SLO * 0.98) {
+          LOG(INFO) << "DEBUG - Estimated decode latency for request "
+                    << request->request_id() << " with "
+                    << _decode_step_global_batch_req_lens.size() << " reqs ("
+                    << num_offline << " offline): " << new_batch_latency << "s";
           LOG(INFO)
               << "DEBUG - Estimated decode latency is close to or exceeds "
                  "SLO, stop scheduling more requests in this batch.";
@@ -772,10 +774,10 @@ void PDOOCScheduler::handle_decode_requests(
       remaining_seq_budget -= allocated_seqs;
       estimate_latency = allocated_estimate_batch_latency;
 
-      LOG(INFO) << "Scheduled request " << request->request_id()
-                << "remaining_token_budget: " << remaining_token_budget
-                << ", remaining_seq_budget: " << remaining_seq_budget
-                << ", estimate_latency: " << estimate_latency;
+      // LOG(INFO) << "Scheduled request " << request->request_id()
+      //           << "remaining_token_budget: " << remaining_token_budget
+      //           << ", remaining_seq_budget: " << remaining_seq_budget
+      //           << ", estimate_latency: " << estimate_latency;
 
       continue;
     }
