@@ -59,15 +59,23 @@ PDOOCScheduler::PDOOCScheduler(Engine* engine, const Options& options)
                  options_.nnodes() / options_.dp_size()) {
   VLOG(1) << "Creating a PD OOC Scheduler";
 
+  // PerfModel::PerfModel(double flop_s_gemm,
+  // double flop_s_attn,
+  // double memory_bw_byte_s_gemm,
+  // double memory_bw_byte_s_attn,
+  // double overhead_prefill_ms,
+  // double overhead_decode_ms,
+  // std::optional<double> network_bw_byte_s)
+
   perf_model::set_perf_model(std::make_shared<perf_model::PerfModel>(
       390 * 1e12 * 0.68,  // FLOPs/s GEMM
       // 390 * 1e12 * 0.59,  // FLOPs/s ATTN_P
       390 * 1e12 * 0.60,  // FLOPs/s ATTN_D
       1600 * 1e9 * 0.58,  // MEM BW GEMM
       1600 * 1e9 * 0.38,  // MEM BW ATTN
-      100 * 1e9,          // net
-      0.018,              // prefill overhead
-      0.002               // decode overhead
+      18,                 // prefill overhead
+      0,                  // decode overhead
+      10 * 1e9            // net
       ));
 
   linear_saturation_bs_ = llm_flops_.linear_saturation_bs();
